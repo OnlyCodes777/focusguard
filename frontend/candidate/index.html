@@ -1,0 +1,41 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>FocusGuard – Candidate</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:560px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
+video{width:100%;border-radius:8px;background:#000;margin-top:1rem}
+input,button{padding:.6rem;font-size:1rem;margin:.25rem 0;width:100%;box-sizing:border-box}
+button{background:#2563eb;color:#fff;border:0;border-radius:6px;cursor:pointer}button:disabled{opacity:.5}
+.notice{background:#f1f5f9;padding:1rem;border-radius:8px;font-size:.9rem}#st{font-size:.85rem;color:#555}
+</style></head><body>
+<h1>Exam session</h1>
+<div class="notice"><b>Privacy notice:</b> with your consent, a still image from your webcam is sampled every few
+seconds and analysed for a phone, extra people, or no person in view. Flagged frames are reviewed by a human proctor
+and deleted after grading. No continuous video is recorded.</div>
+<input id="exam" placeholder="Exam ID" value="midterm-cs101">
+<input id="cand" placeholder="Candidate ID" value="cand-001">
+<label><input type="checkbox" id="ok" style="width:auto"> I consent to webcam sampling for proctoring.</label>
+<button id="go" disabled>Start exam</button><div id="st"></div>
+<video id="v" autoplay muted playsinline></video><canvas id="c" width="640" height="480" hidden></canvas>
+<script>
+const $=id=>document.getElementById(id), q=new URLSearchParams(location.search);
+const INTERVAL_MS=+(q.get('interval')||2000);
+$('ok').onchange=()=>$('go').disabled=!$('ok').checked;
+let sent=0;
+$('go').onclick=async()=>{
+  try{$('v').srcObject=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});}
+  catch(e){$('st').textContent='Camera permission denied: '+e.message;return}
+  $('go').disabled=true;
+  const ctx=$('c').getContext('2d');
+  setInterval(()=>{
+    ctx.drawImage($('v'),0,0,640,480);
+    $('c').toBlob(async b=>{
+      const f=new FormData();
+      f.append('exam_id',$('exam').value);f.append('candidate_id',$('cand').value);f.append('file',b,'f.jpg');
+      try{
+        const r=await fetch('/api/v1/frame',{method:'POST',body:f});
+        $('st').textContent=r.ok?`Monitoring… ${++sent} frames sent`:`Server said ${r.status} (frame skipped)`;
+      }catch(e){$('st').textContent='Network error – retrying'}
+    },'image/jpeg',0.65);
+  },INTERVAL_MS);
+};
+</script></body></html>

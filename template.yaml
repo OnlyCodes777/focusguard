@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: FocusGuard serverless exam monitoring demo in ap-south-1
+
+Parameters:
+  ProctorToken:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: Shared token required by proctor endpoints
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+
+Resources:
+  FocusGuardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireIncomingFrames
+            Status: Enabled
+            Prefix: incoming/
+            ExpirationInDays: 1
+
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: {ReadCapacityUnits: 5, WriteCapacityUnits: 5}
+      AttributeDefinitions:
+        - {AttributeName: exam_id, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: exam_id, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: {ReadCapacityUnits: 5, WriteCapacityUnits: 5}
+      AttributeDefinitions:
+        - {AttributeName: state_key, AttributeType: S}
+      KeySchema:
+        - {AttributeName: state_key, KeyType: HASH}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  FrameDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  FrameQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 360
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FrameDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  WebRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: focusguard-web-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${FocusGuardBucket.Arn}/incoming/*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub '${FocusGuardBucket.Arn}/evidence/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt FocusGuardBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: evidence/*
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt FrameQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:UpdateItem]
+                Resource: !GetAtt IncidentTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/focusguard-web:*'
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: focusguard-worker-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub '${FocusGuardBucket.Arn}/incoming/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${FocusGuardBucket.Arn}/evidence/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt StateTable.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt IncidentTable.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt FrameQueue.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/focusguard-worker:*'
+
+  WebFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Zip
+      CodeUri: build/web/
+      Handler: main.handler
+      FunctionName: focusguard-web
+      Role: !GetAtt WebRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref FocusGuardBucket
+          FRAME_QUEUE_URL: !Ref FrameQueue
+          INCIDENT_TABLE: !Ref IncidentTable
+          PROCTOR_TOKEN: !Ref ProctorToken
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+      FunctionUrlConfig:
+        AuthType: NONE
+
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: WebFunction
+    Properties:
+      LogGroupName: /aws/lambda/focusguard-web
+      RetentionInDays: 7
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Zip
+      CodeUri: build/worker/
+      Handler: worker.handler
+      Layers:
+        - !Ref WorkerDependenciesLayer
+      FunctionName: focusguard-worker
+      Role: !GetAtt WorkerRole.Arn
+      MemorySize: 2048
+      Timeout: 60
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref FocusGuardBucket
+          INCIDENT_TABLE: !Ref IncidentTable
+          STATE_TABLE: !Ref StateTable
+          CONF_THRESHOLD: '0.5'
+          STREAK_N: '2'
+          COOLDOWN_S: '30'
+          PROCTOR_TOKEN: !Ref ProctorToken
+          MODEL_PATH: /var/task/models/yolov8n.onnx
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+      Events:
+        FrameEvents:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FrameQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  WorkerDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: focusguard-worker-dependencies
+      Description: Linux x86_64 Python 3.12 inference dependencies
+      ContentUri: build/worker-layer/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [x86_64]
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: WorkerFunction
+    Properties:
+      LogGroupName: /aws/lambda/focusguard-worker
+      RetentionInDays: 7
+
+  FunctionUrlInvokeFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  FunctionUrlInvokeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  FunctionUrl:
+    Description: Public application URL
+    Value: !GetAtt WebFunctionUrl.FunctionUrl
+  CandidateUrl:
+    Description: Candidate exam page
+    Value: !Join ['', [!GetAtt WebFunctionUrl.FunctionUrl, 'candidate/']]
+  ProctorUrl:
+    Description: Proctor dashboard
+    Value: !Join ['', [!GetAtt WebFunctionUrl.FunctionUrl, 'proctor/']]

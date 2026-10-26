@@ -1,0 +1,81 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>FocusGuard – Proctor</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;color:#1a1a1a;background:#f8fafc}
+header{background:#0f172a;color:#fff;padding:.8rem 1.2rem;display:flex;gap:.8rem;align-items:center;flex-wrap:wrap}
+header input,header select,header button{padding:.4rem;border-radius:4px;border:0}
+main{padding:1rem;max-width:960px;margin:auto}
+.row{background:#fff;border-left:5px solid #94a3b8;padding:.7rem 1rem;margin:.5rem 0;border-radius:6px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 1px 2px #0001}
+.PHONE_DETECTED{border-color:#dc2626}.MULTIPLE_PEOPLE{border-color:#ea580c}.NO_FACE_DETECTED{border-color:#ca8a04}
+.new{animation:f 1.5s}@keyframes f{from{background:#fef08a}}
+small{color:#64748b}button{cursor:pointer}
+#modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center}
+#modal img{max-width:90vw;max-height:85vh;border-radius:8px}
+</style></head><body>
+<header><b>FocusGuard</b><span id="live">● offline</span>
+<input id="tok" type="password" placeholder="Proctor token">
+<input id="exam" placeholder="Exam ID" value="midterm-cs101">
+<select id="flt"><option value="">All types</option><option>PHONE_DETECTED</option><option>MULTIPLE_PEOPLE</option><option>NO_FACE_DETECTED</option></select>
+<button id="conn">Connect</button><button id="csv">Export CSV</button><button id="aws">Export audit CSV</button><button id="purge">Purge evidence</button></header>
+<main><p><small>Alerts are signals for human review, not proof of misconduct.</small></p><div id="list"></div></main>
+<div id="modal"><img id="img"></div>
+<script>
+const $=id=>document.getElementById(id);let rows=[],poller=null,flash=null,first=true;
+$('tok').value=localStorage.fgTok||'';
+function render(){
+  const f=$('flt').value;
+  $('list').innerHTML=rows.filter(r=>!f||r.event_type===f).sort((a,b)=>b.created_at.localeCompare(a.created_at)).map(r=>`
+  <div class="row ${r.event_type} ${flash===r.incident_id?'new':''}">
+   <div><b>${r.event_type}</b> · ${r.candidate_id} <small>${new Date(r.created_at).toLocaleTimeString()} · conf ${(+r.confidence).toFixed(2)} · ${r.status}</small></div>
+   ${r.evidence_key?`<button onclick="show('${r.evidence_key}')">Evidence</button>`:''}</div>`).join('')||'<p>No incidents yet.</p>';
+}
+async function show(key){
+  const r=await fetch('/api/v1/evidence?key='+encodeURIComponent(key),{headers:{'X-Proctor-Token':$('tok').value}});
+  if(!r.ok)return alert('Evidence request failed: '+r.status);
+  $('img').src=URL.createObjectURL(await r.blob());$('modal').style.display='flex';
+}
+$('modal').onclick=()=>{$('modal').style.display='none';$('img').src=''};
+$('flt').onchange=render;
+async function poll(){
+  try{
+    const url='/api/v1/incidents?exam_id='+encodeURIComponent($('exam').value);
+    const r=await fetch(url,{headers:{'X-Proctor-Token':$('tok').value}});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const data=await r.json(),known=new Set(rows.map(x=>x.incident_id));let changed=false;
+    for(const item of data.items){
+      const old=rows.find(x=>x.incident_id===item.incident_id);
+      if(!old||old.status!==item.status||old.evidence_key!==item.evidence_key){
+        if(!old&&!first)flash=item.incident_id;
+        rows=rows.filter(x=>x.incident_id!==item.incident_id);rows.push(item);changed=true;
+      }
+    }
+    first=false;$('live').textContent='● live';if(changed)render();
+    if(flash){const flashing=flash;setTimeout(()=>{if(flash===flashing){flash=null;render()}},1600)}
+  }catch(e){$('live').textContent='● error';console.error(e)}
+}
+$('conn').onclick=()=>{
+  localStorage.fgTok=$('tok').value;rows=[];first=true;flash=null;
+  if(poller)clearInterval(poller);
+  $('live').textContent='● live';poll();poller=setInterval(poll,3000);
+};
+$('csv').onclick=()=>{
+  const h=['incident_id','exam_id','candidate_id','event_type','confidence','created_at','status'];
+  const t=[h.join(','),...rows.map(r=>h.map(k=>r[k]).join(','))].join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/csv'}));a.download='audit.csv';a.click();
+};
+$('aws').onclick=async()=>{
+  const r=await fetch('/api/v1/audit?exam_id='+encodeURIComponent($('exam').value),{headers:{'X-Proctor-Token':$('tok').value}});
+  if(!r.ok)return alert('Audit request failed: '+r.status);
+  const j=await r.json();
+  const h=['incident_id','exam_id','candidate_id','event_type','confidence','created_at','status'];
+  const t=[h.join(','),...j.items.map(r=>h.map(k=>r[k]).join(','))].join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/csv'}));a.download='focusguard-audit.csv';a.click();
+};
+$('purge').onclick=async()=>{
+  if(!confirm('Delete all evidence images for this exam?'))return;
+  const r=await fetch('/api/v1/exam/'+$('exam').value,{method:'DELETE',headers:{'X-Proctor-Token':$('tok').value}});
+  if(!r.ok)return alert('Failed '+r.status);
+  rows=rows.map(x=>({...x,status:'PURGED',evidence_key:null}));render();
+  alert('Purged: '+JSON.stringify(await r.json()));
+};
+</script></body></html>
